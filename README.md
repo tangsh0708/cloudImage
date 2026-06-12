@@ -58,7 +58,15 @@ cloudImage
 ├─ src
 │  ├─ pages
 │  │  └─ index
-│  │     └─ index.vue       # 首页，负责图片管理界面与交互
+│  │     ├─ components      # 首页拆分出的展示组件
+│  │     │  ├─ GalleryGrid.vue
+│  │     │  ├─ GalleryHeader.vue
+│  │     │  ├─ MovePanel.vue
+│  │     │  └─ SelectionToolbar.vue
+│  │     ├─ constants.js    # 首页常量，如排序项、分页大小、占位图
+│  │     ├─ helpers.js      # 首页通用工具，如防抖、文件大小格式化
+│  │     ├─ useGalleryPage.js # 首页业务状态与交互编排
+│  │     └─ index.vue       # 首页入口，仅负责组件组合
 │  ├─ utils
 │  │  └─ cloud.js           # 云开发相关逻辑：目录、图片、数据库操作
 │  ├─ App.vue               # 应用根组件
@@ -281,7 +289,9 @@ yarn build:mp-weixin
 
 ## 页面交互说明
 
-首页位于 [`src/pages/index/index.vue`](/D:/workspace/my_study/cloudImage/src/pages/index/index.vue:1)，当前包含以下交互：
+首页入口位于 [`src/pages/index/index.vue`](/D:/workspace/my_study/cloudImage/src/pages/index/index.vue:1)，当前仅负责组合页面组件。页面业务逻辑集中在 [`src/pages/index/useGalleryPage.js`](/D:/workspace/my_study/cloudImage/src/pages/index/useGalleryPage.js:1)，展示结构拆分在 [`src/pages/index/components`](/D:/workspace/my_study/cloudImage/src/pages/index/components:1) 下。
+
+当前包含以下交互：
 
 - 顶部工具栏：返回、新建分组、上传、刷新
 - 长按刷新：重建分组图片数量缓存
