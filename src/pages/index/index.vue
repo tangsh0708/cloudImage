@@ -38,6 +38,38 @@
           </text>
         </view>
       </view>
+
+      <view class="filter-bar">
+        <view class="search-box">
+          <text class="search-icon">⌕</text>
+          <input
+            v-model="searchKeyword"
+            class="search-input"
+            confirm-type="search"
+            placeholder="搜索当前分组"
+          />
+          <text
+            v-if="searchKeyword"
+            class="search-clear"
+            @click="searchKeyword = ''"
+          >
+            ×
+          </text>
+        </view>
+        <picker
+          mode="selector"
+          :range="sortOptions"
+          range-key="label"
+          :value="sortIndex"
+          @change="handleSortChange"
+        >
+          <view class="sort-picker">{{ sortOptions[sortIndex].label }}</view>
+        </picker>
+      </view>
+
+      <view class="content-summary">
+        <text>{{ contentSummary }}</text>
+      </view>
     </view>
 
     <!-- 批量选择工具栏 -->
@@ -46,11 +78,57 @@
       <view class="selection-actions">
         <view class="selection-btn" @click="cancelSelection">取消</view>
         <view
+          class="selection-btn"
+          :class="{ disabled: isMoving }"
+          @click="openMovePanel(selectedItems)"
+        >
+          {{ isMoving ? "移动中..." : "移动" }}
+        </view>
+        <view
           class="selection-btn selection-btn-delete"
           :class="{ disabled: isDeleting }"
           @click="batchDelete"
         >
           {{ isDeleting ? "删除中..." : "删除" }}
+        </view>
+      </view>
+    </view>
+
+    <view v-if="movePanelVisible" class="modal-mask" @click="closeMovePanel">
+      <view class="move-panel" @click.stop>
+        <view class="move-panel-header">
+          <view>
+            <text class="move-title">移动到分组</text>
+            <text class="move-desc">共 {{ pendingMoveItems.length }} 张图片</text>
+          </view>
+          <text class="move-close" @click="closeMovePanel">×</text>
+        </view>
+        <scroll-view class="folder-options" scroll-y>
+          <view
+            v-for="folder in folderOptions"
+            :key="folder.path"
+            class="folder-option"
+            :class="{
+              active: moveTargetPath === folder.path,
+              disabled: folder.path === currentPath,
+            }"
+            @click="selectMoveTarget(folder)"
+          >
+            <text class="folder-option-name">{{ folder.breadcrumbName }}</text>
+            <text v-if="folder.path === currentPath" class="folder-option-note">
+              当前分组
+            </text>
+          </view>
+        </scroll-view>
+        <view class="move-actions">
+          <view class="move-btn" @click="closeMovePanel">取消</view>
+          <view
+            class="move-btn move-btn-primary"
+            :class="{ disabled: !moveTargetPath || isMoving }"
+            @click="confirmMove"
+          >
+            {{ isMoving ? "移动中..." : "确认移动" }}
+          </view>
         </view>
       </view>
     </view>
@@ -104,13 +182,16 @@
           </view>
           <view class="item-info">
             <text class="item-name">
-              {{ item.type === "folder" ? item.name : "" }}
+              {{ item.name }}
             </text>
             <text
-              v-if="item.type === 'folder' && item.imageCount > 0"
+              v-if="item.type === 'folder'"
               class="item-count"
             >
-              {{ item.imageCount }} 张图片
+              {{ item.imageCount > 0 ? `${item.imageCount} 张图片` : "空分组" }}
+            </text>
+            <text v-else class="item-meta">
+              {{ formatFileSize(item.size) }}
             </text>
           </view>
           <view v-if="item.type === 'folder'" class="folder-badge">📁</view>
@@ -118,10 +199,10 @@
       </view>
 
       <!-- 加载更多提示 -->
-      <view v-if="hasMore" class="loading-more">
+      <view v-if="gridItems.length > pageSize && hasMore" class="loading-more">
         <text>{{ loadingMore ? "加载中..." : "上拉加载更多" }}</text>
       </view>
-      <view v-else class="no-more">
+      <view v-else-if="gridItems.length > pageSize" class="no-more">
         <text>没有更多了</text>
       </view>
     </scroll-view>
@@ -129,16 +210,21 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, watch } from "vue";
 import {
   ROOT_PATH,
+  assertValidName,
   buildBreadcrumbs,
   createFolder,
   deleteFolder,
   deleteImage,
   ensureRootFolder,
   getParentPath,
+  listAllFolders,
   listFolderContent,
+  moveImages,
+  renameFolder,
+  renameImage,
   uploadImageToCloud,
 } from "@/utils/cloud";
 
@@ -180,6 +266,34 @@ const formatFileSize = (bytes) => {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 };
 
+const getLocalFileName = (filePath) => {
+  return String(filePath || "")
+    .split(/[\\/]/)
+    .pop();
+};
+
+const showError = (error, fallback) => {
+  uni.showToast({ title: error.message || fallback, icon: "none" });
+};
+
+const compareText = (a, b) => {
+  return String(a || "").localeCompare(String(b || ""), "zh-Hans-CN");
+};
+
+const compareTimeDesc = (a, b) => {
+  return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+};
+
+const sortByGroup = (items, comparator) => {
+  const folders = items
+    .filter((item) => item.type === "folder")
+    .sort(comparator);
+  const images = items
+    .filter((item) => item.type === "image")
+    .sort(comparator);
+  return [...folders, ...images];
+};
+
 // 响应式数据
 const currentPath = ref(ROOT_PATH);
 const breadcrumbs = ref([{ name: "root", path: ROOT_PATH }]);
@@ -187,19 +301,35 @@ const folderList = ref([]);
 const imageList = ref([]);
 const loading = ref(false);
 const refreshing = ref(false);
+const searchKeyword = ref("");
+const sortIndex = ref(0);
 
 // 批量选择相关
 const selectionMode = ref(false);
 const selectedItems = ref([]);
 const isDeleting = ref(false);
+const isMoving = ref(false);
+
+// 移动面板相关
+const movePanelVisible = ref(false);
+const folderOptions = ref([]);
+const pendingMoveItems = ref([]);
+const moveTargetPath = ref("");
 
 // 分页相关
 const pageSize = ref(20);
 const currentPage = ref(1);
 const loadingMore = ref(false);
 
+const sortOptions = [
+  { label: "默认排序", value: "default" },
+  { label: "名称排序", value: "name" },
+  { label: "最近更新", value: "time" },
+  { label: "图片大小", value: "size" },
+];
+
 // 计算属性
-const gridItems = computed(() => {
+const baseGridItems = computed(() => {
   return [
     ...folderList.value.map((folder) => ({
       type: "folder",
@@ -213,6 +343,39 @@ const gridItems = computed(() => {
       imageIndex: index,
     })),
   ];
+});
+
+const gridItems = computed(() => {
+  const keyword = searchKeyword.value.trim().toLowerCase();
+  let items = baseGridItems.value;
+
+  if (keyword) {
+    items = items.filter((item) => {
+      const name = String(item.name || "").toLowerCase();
+      const ext = String(item.ext || "").toLowerCase();
+      return name.includes(keyword) || ext.includes(keyword);
+    });
+  }
+
+  const currentSort = sortOptions[sortIndex.value]?.value;
+  if (currentSort === "name") {
+    return sortByGroup([...items], (a, b) => compareText(a.name, b.name));
+  }
+
+  if (currentSort === "time") {
+    return [...items].sort(compareTimeDesc);
+  }
+
+  if (currentSort === "size") {
+    return sortByGroup([...items], (a, b) => {
+      if (a.type === "folder" && b.type === "folder") {
+        return compareText(a.name, b.name);
+      }
+      return (b.size || 0) - (a.size || 0);
+    });
+  }
+
+  return items;
 });
 
 const displayItems = computed(() => {
@@ -229,6 +392,14 @@ const previewUrls = computed(() => {
 });
 
 const emptyText = computed(() => {
+  if (searchKeyword.value.trim()) {
+    return {
+      icon: "🔎",
+      text: "没有匹配结果",
+      hint: "换个关键词试试",
+    };
+  }
+
   if (currentPath.value === ROOT_PATH) {
     return {
       icon: "📂",
@@ -243,6 +414,16 @@ const emptyText = computed(() => {
   };
 });
 
+const contentSummary = computed(() => {
+  const total = `${folderList.value.length} 个分组 · ${imageList.value.length} 张图片`;
+
+  if (!searchKeyword.value.trim()) {
+    return total;
+  }
+
+  return `${total} · 当前匹配 ${gridItems.value.length} 项`;
+});
+
 // 方法
 const bootstrap = async () => {
   try {
@@ -250,7 +431,7 @@ const bootstrap = async () => {
     await ensureRootFolder();
     await loadCurrentContent();
   } catch (error) {
-    uni.showToast({ title: error.message || "初始化失败", icon: "none" });
+    showError(error, "初始化失败");
   } finally {
     loading.value = false;
   }
@@ -268,7 +449,7 @@ const loadCurrentContent = async () => {
     currentPage.value = 1;
     breadcrumbs.value = buildBreadcrumbs(currentPath.value);
   } catch (error) {
-    uni.showToast({ title: error.message || "加载失败", icon: "none" });
+    showError(error, "加载失败");
   } finally {
     loading.value = false;
     refreshing.value = false;
@@ -284,6 +465,8 @@ const enterFolder = async (path) => {
   if (!path || currentPath.value === path) {
     return;
   }
+  cancelSelection();
+  searchKeyword.value = "";
   currentPath.value = path;
   await loadCurrentContent();
 };
@@ -292,8 +475,14 @@ const goBack = async () => {
   if (currentPath.value === ROOT_PATH) {
     return;
   }
+  cancelSelection();
+  searchKeyword.value = "";
   currentPath.value = getParentPath(currentPath.value);
   await loadCurrentContent();
+};
+
+const handleSortChange = (event) => {
+  sortIndex.value = Number(event.detail.value || 0);
 };
 
 const handleCreateFolder = async () => {
@@ -308,24 +497,10 @@ const handleCreateFolder = async () => {
 
   const folderName = (modal.content || "").trim();
 
-  // 验证文件夹名称
-  if (!folderName) {
-    uni.showToast({ title: "分组名称不能为空", icon: "none" });
-    return;
-  }
-
-  if (folderName.length > 50) {
-    uni.showToast({ title: "分组名称不能超过50个字符", icon: "none" });
-    return;
-  }
-
-  // 检查非法字符
-  const invalidChars = /[\/\\:*?"<>|]/;
-  if (invalidChars.test(folderName)) {
-    uni.showToast({
-      title: '分组名称不能包含特殊字符 / \\ : * ? " < > |',
-      icon: "none",
-    });
+  try {
+    assertValidName(folderName, "分组名称");
+  } catch (error) {
+    showError(error, "分组名称无效");
     return;
   }
 
@@ -334,7 +509,7 @@ const handleCreateFolder = async () => {
     uni.showToast({ title: "创建成功", icon: "success" });
     await loadCurrentContent();
   } catch (error) {
-    uni.showToast({ title: error.message || "创建失败", icon: "none" });
+    showError(error, "创建失败");
   }
 };
 
@@ -345,7 +520,15 @@ const handleUpload = async () => {
       sizeType: ["compressed"],
       sourceType: ["album", "camera"],
     });
-    const files = pickRes.tempFilePaths || [];
+    const tempFiles = pickRes.tempFiles || [];
+    const files = (pickRes.tempFilePaths || [])
+      .map((filePath, index) => ({
+        path: filePath,
+        name: tempFiles[index]?.name || getLocalFileName(filePath),
+        size: tempFiles[index]?.size || 0,
+      }))
+      .filter((file) => file.path);
+
     if (!files.length) {
       return;
     }
@@ -355,12 +538,12 @@ const handleUpload = async () => {
 
     // 使用 Promise.allSettled 支持部分上传失败
     const results = await Promise.allSettled(
-      files.map((filePath) => {
-        const originalName = filePath.split("/").pop() || "";
+      files.map((file) => {
         return uploadImageToCloud(
-          filePath,
+          file.path,
           currentPath.value,
-          originalName,
+          file.name,
+          { size: file.size },
         ).finally(() => {
           completed++;
           uni.showLoading({
@@ -391,7 +574,7 @@ const handleUpload = async () => {
     await loadCurrentContent();
   } catch (error) {
     uni.hideLoading();
-    uni.showToast({ title: error.message || "上传失败", icon: "none" });
+    showError(error, "上传失败");
   }
 };
 
@@ -452,12 +635,16 @@ const handleLongPress = async (item) => {
 
     try {
       const res = await uni.showActionSheet({
-        itemList: ["删除图片", "进入选择模式"],
+        itemList: ["重命名图片", "移动图片", "删除图片", "进入选择模式"],
       });
 
       if (res.tapIndex === 0) {
-        await handleDeleteImage(item);
+        await handleRenameImage(item);
       } else if (res.tapIndex === 1) {
+        await openMovePanel([item]);
+      } else if (res.tapIndex === 2) {
+        await handleDeleteImage(item);
+      } else if (res.tapIndex === 3) {
         enterSelectionMode(item);
       }
     } catch (error) {
@@ -468,12 +655,24 @@ const handleLongPress = async (item) => {
       uni.showToast({ title: "根目录不能删除", icon: "none" });
       return;
     }
-    const modal = await uni.showModal({
-      title: "确认删除",
-      content: `确定要删除分组"${item.name}"吗？只能删除空分组。`,
-    });
-    if (modal.confirm) {
-      await handleDeleteFolder(item);
+    try {
+      const res = await uni.showActionSheet({
+        itemList: ["重命名分组", "删除分组"],
+      });
+
+      if (res.tapIndex === 0) {
+        await handleRenameFolder(item);
+      } else if (res.tapIndex === 1) {
+        const modal = await uni.showModal({
+          title: "确认删除",
+          content: `确定要删除分组"${item.name}"吗？只能删除空分组。`,
+        });
+        if (modal.confirm) {
+          await handleDeleteFolder(item);
+        }
+      }
+    } catch (error) {
+      // 用户取消操作，不需要处理
     }
   }
 };
@@ -540,9 +739,121 @@ const batchDelete = async () => {
     await loadCurrentContent();
   } catch (error) {
     uni.hideLoading();
-    uni.showToast({ title: error.message || "删除失败", icon: "none" });
+    showError(error, "删除失败");
   } finally {
     isDeleting.value = false;
+  }
+};
+
+const handleRenameImage = async (item) => {
+  const modal = await uni.showModal({
+    title: "重命名图片",
+    editable: true,
+    placeholderText: "请输入图片名称",
+    content: item.name || "",
+  });
+
+  if (!modal.confirm) {
+    return;
+  }
+
+  try {
+    await withLoading("重命名中", async () => {
+      await renameImage(item._id, modal.content || "");
+    });
+    uni.showToast({ title: "重命名成功", icon: "success" });
+    await loadCurrentContent();
+  } catch (error) {
+    showError(error, "重命名失败");
+  }
+};
+
+const handleRenameFolder = async (item) => {
+  const modal = await uni.showModal({
+    title: "重命名分组",
+    editable: true,
+    placeholderText: "请输入分组名称",
+    content: item.name || "",
+  });
+
+  if (!modal.confirm) {
+    return;
+  }
+
+  try {
+    let nextPath = currentPath.value;
+    await withLoading("重命名中", async () => {
+      nextPath = await renameFolder(item.path, modal.content || "");
+    });
+
+    if (currentPath.value === item.path) {
+      currentPath.value = nextPath;
+    }
+
+    uni.showToast({ title: "重命名成功", icon: "success" });
+    await loadCurrentContent();
+  } catch (error) {
+    showError(error, "重命名失败");
+  }
+};
+
+const openMovePanel = async (items) => {
+  const imageItems = items.filter((item) => item.type === "image");
+
+  if (!imageItems.length || isMoving.value) {
+    return;
+  }
+
+  try {
+    pendingMoveItems.value = imageItems;
+    moveTargetPath.value = "";
+    folderOptions.value = await listAllFolders();
+    movePanelVisible.value = true;
+  } catch (error) {
+    showError(error, "加载分组失败");
+  }
+};
+
+const selectMoveTarget = (folder) => {
+  if (!folder || folder.path === currentPath.value) {
+    return;
+  }
+  moveTargetPath.value = folder.path;
+};
+
+const closeMovePanel = () => {
+  if (isMoving.value) {
+    return;
+  }
+  movePanelVisible.value = false;
+  moveTargetPath.value = "";
+  pendingMoveItems.value = [];
+};
+
+const confirmMove = async () => {
+  if (!moveTargetPath.value || isMoving.value) {
+    return;
+  }
+
+  try {
+    isMoving.value = true;
+    uni.showLoading({ title: "移动中", mask: true });
+    await moveImages(
+      pendingMoveItems.value.map((item) => item._id),
+      moveTargetPath.value,
+    );
+    uni.hideLoading();
+    uni.showToast({ title: "移动成功", icon: "success" });
+    movePanelVisible.value = false;
+    moveTargetPath.value = "";
+    pendingMoveItems.value = [];
+    cancelSelection();
+    await loadCurrentContent();
+  } catch (error) {
+    uni.hideLoading();
+    showError(error, "移动失败");
+  } finally {
+    isMoving.value = false;
   }
 };
 
@@ -554,7 +865,7 @@ const handleDeleteImage = async (item) => {
     uni.showToast({ title: "删除成功", icon: "success" });
     await loadCurrentContent();
   } catch (error) {
-    uni.showToast({ title: error.message || "删除失败", icon: "none" });
+    showError(error, "删除失败");
   }
 };
 
@@ -566,9 +877,13 @@ const handleDeleteFolder = async (item) => {
     uni.showToast({ title: "删除成功", icon: "success" });
     await loadCurrentContent();
   } catch (error) {
-    uni.showToast({ title: error.message || "删除失败", icon: "none" });
+    showError(error, "删除失败");
   }
 };
+
+watch([searchKeyword, sortIndex], () => {
+  currentPage.value = 1;
+});
 
 // 生命周期
 onMounted(() => {
@@ -709,6 +1024,69 @@ onMounted(() => {
   margin: 0 8rpx;
   color: #c0c4cc;
   font-size: 28rpx;
+}
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 14rpx;
+  margin-top: 18rpx;
+}
+
+.search-box {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  height: 68rpx;
+  padding: 0 18rpx;
+  border-radius: 18rpx;
+  background: #f3f6fb;
+  box-sizing: border-box;
+}
+
+.search-icon {
+  font-size: 30rpx;
+  color: #9aa4b2;
+}
+
+.search-input {
+  flex: 1;
+  min-width: 0;
+  height: 68rpx;
+  font-size: 26rpx;
+  color: #303133;
+}
+
+.search-clear {
+  width: 36rpx;
+  height: 36rpx;
+  border-radius: 18rpx;
+  background: #d9e2ef;
+  color: #637083;
+  font-size: 28rpx;
+  line-height: 34rpx;
+  text-align: center;
+}
+
+.sort-picker {
+  min-width: 150rpx;
+  height: 68rpx;
+  padding: 0 20rpx;
+  border-radius: 18rpx;
+  background: #eef5ff;
+  color: #2f6fda;
+  font-size: 24rpx;
+  line-height: 68rpx;
+  text-align: center;
+  box-sizing: border-box;
+}
+
+.content-summary {
+  margin-top: 12rpx;
+  font-size: 22rpx;
+  color: #8b96a8;
 }
 
 .section {
@@ -913,12 +1291,140 @@ onMounted(() => {
   color: #606266;
 }
 
+.selection-btn.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
 .selection-btn-delete {
   background: #f56c6c;
   color: #ffffff;
 }
 
 .selection-btn-delete.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.modal-mask {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(18, 28, 43, 0.48);
+  z-index: 200;
+}
+
+.move-panel {
+  width: 100%;
+  max-height: 78vh;
+  padding: 28rpx 24rpx calc(28rpx + env(safe-area-inset-bottom));
+  border-radius: 28rpx 28rpx 0 0;
+  background: #ffffff;
+  box-sizing: border-box;
+}
+
+.move-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 20rpx;
+}
+
+.move-title {
+  display: block;
+  margin-bottom: 8rpx;
+  font-size: 34rpx;
+  font-weight: 600;
+  color: #1f2d3d;
+}
+
+.move-desc {
+  display: block;
+  font-size: 24rpx;
+  color: #8b96a8;
+}
+
+.move-close {
+  width: 56rpx;
+  height: 56rpx;
+  border-radius: 28rpx;
+  background: #f2f4f7;
+  color: #7a869a;
+  font-size: 34rpx;
+  line-height: 52rpx;
+  text-align: center;
+}
+
+.folder-options {
+  max-height: 52vh;
+}
+
+.folder-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  min-height: 76rpx;
+  padding: 0 18rpx;
+  margin-bottom: 10rpx;
+  border: 2rpx solid transparent;
+  border-radius: 16rpx;
+  background: #f7f9fc;
+  box-sizing: border-box;
+}
+
+.folder-option.active {
+  border-color: #409eff;
+  background: #ecf5ff;
+}
+
+.folder-option.disabled {
+  opacity: 0.55;
+}
+
+.folder-option-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 26rpx;
+  color: #2f3a4a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.folder-option-note {
+  font-size: 22rpx;
+  color: #9aa4b2;
+}
+
+.move-actions {
+  display: flex;
+  gap: 18rpx;
+  margin-top: 22rpx;
+}
+
+.move-btn {
+  flex: 1;
+  height: 78rpx;
+  border-radius: 18rpx;
+  background: #f2f4f7;
+  color: #606266;
+  font-size: 28rpx;
+  line-height: 78rpx;
+  text-align: center;
+}
+
+.move-btn-primary {
+  background: linear-gradient(135deg, #3495ff 0%, #5fb3ff 100%);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.move-btn.disabled {
   opacity: 0.5;
   pointer-events: none;
 }
