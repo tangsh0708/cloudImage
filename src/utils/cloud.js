@@ -2,6 +2,9 @@ const ROOT_PATH = "/root";
 const FOLDERS_COLLECTION = "folders";
 const IMAGES_COLLECTION = "images";
 const INVALID_NAME_PATTERN = /[\/\\:*?"<>|]/;
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_PAGE_SIZE = 50;
+const TEMP_URL_BATCH_SIZE = 50;
 
 function assertWechatCloud() {
   // #ifdef MP-WEIXIN
@@ -61,7 +64,7 @@ function replacePathPrefix(value, oldPrefix, newPrefix) {
 }
 
 function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function getDepth(path) {
@@ -118,6 +121,102 @@ function createPathRegExp(db, folderPath) {
   });
 }
 
+function createKeywordRegExp(db, keyword) {
+  return db.RegExp({
+    regexp: escapeRegExp(keyword),
+    options: "i",
+  });
+}
+
+function normalizeListOptions(options = {}) {
+  const page = Math.max(1, Number(options.page) || 1);
+  const pageSize = Math.min(
+    MAX_PAGE_SIZE,
+    Math.max(1, Number(options.pageSize) || DEFAULT_PAGE_SIZE),
+  );
+
+  return {
+    page,
+    pageSize,
+    keyword: String(options.keyword || options.searchKeyword || "").trim(),
+    sortBy: options.sortBy || "default",
+  };
+}
+
+function getImageSort(sortBy) {
+  if (sortBy === "name") {
+    return [
+      ["name", "asc"],
+      ["createdAt", "desc"],
+    ];
+  }
+
+  if (sortBy === "time") {
+    return [
+      ["updatedAt", "desc"],
+      ["createdAt", "desc"],
+    ];
+  }
+
+  if (sortBy === "size") {
+    return [
+      ["size", "desc"],
+      ["createdAt", "desc"],
+    ];
+  }
+
+  return [["createdAt", "desc"]];
+}
+
+function getFolderSort(sortBy) {
+  if (sortBy === "time") {
+    return [
+      ["updatedAt", "desc"],
+      ["name", "asc"],
+    ];
+  }
+
+  if (sortBy === "size") {
+    return [
+      ["imageCount", "desc"],
+      ["name", "asc"],
+    ];
+  }
+
+  return [["name", "asc"]];
+}
+
+function applySort(query, sortList) {
+  return sortList.reduce((acc, [field, order]) => acc.orderBy(field, order), query);
+}
+
+function buildFolderWhere(db, parentPath, keyword) {
+  const where = { parentPath };
+
+  if (keyword) {
+    where.name = createKeywordRegExp(db, keyword);
+  }
+
+  return where;
+}
+
+function buildImageWhere(db, folderPath, keyword) {
+  if (!keyword) {
+    return { folderPath };
+  }
+
+  const _ = db.command;
+  const keywordRegExp = createKeywordRegExp(db, keyword);
+
+  return _.and([
+    { folderPath },
+    _.or([
+      { name: keywordRegExp },
+      { ext: keywordRegExp },
+    ]),
+  ]);
+}
+
 async function getLocalFileSize(filePath) {
   if (typeof uni === "undefined" || !uni.getFileInfo) {
     return 0;
@@ -139,81 +238,6 @@ async function runInBatches(items, mapper, batchSize = 8) {
   }
 }
 
-async function ensureRootFolder() {
-  const db = getDb();
-  const query = await db
-    .collection(FOLDERS_COLLECTION)
-    .where({
-      path: ROOT_PATH,
-    })
-    .limit(1)
-    .get();
-
-  if (query.data.length > 0) {
-    return query.data[0];
-  }
-
-  const now = Date.now();
-  const rootFolder = {
-    name: "root",
-    path: ROOT_PATH,
-    parentPath: "",
-    depth: 0,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  await db.collection(FOLDERS_COLLECTION).add({
-    data: rootFolder,
-  });
-
-  return rootFolder;
-}
-
-async function createFolder(parentPath, name) {
-  const db = getDb();
-  const folderName = assertValidName(name, "分组名称");
-  const path = joinPath(parentPath, folderName);
-  const existed = await db
-    .collection(FOLDERS_COLLECTION)
-    .where({
-      path,
-    })
-    .limit(1)
-    .get();
-
-  if (existed.data.length > 0) {
-    throw new Error("该分组已存在");
-  }
-
-  const now = Date.now();
-  await db.collection(FOLDERS_COLLECTION).add({
-    data: {
-      name: folderName,
-      path,
-      parentPath,
-      depth: getDepth(path),
-      createdAt: now,
-      updatedAt: now,
-    },
-  });
-}
-
-async function getTempUrls(fileIds) {
-  if (!fileIds.length) {
-    return {};
-  }
-
-  const res = await wx.cloud.getTempFileURL({
-    fileList: fileIds,
-  });
-
-  return res.fileList.reduce((acc, item) => {
-    acc[item.fileID] = item.tempFileURL || "";
-    return acc;
-  }, {});
-}
-
 async function getAllCollectionData(query, batchSize = 20) {
   let allData = [];
   let skip = 0;
@@ -233,95 +257,190 @@ async function getAllCollectionData(query, batchSize = 20) {
   return allData;
 }
 
+async function getTempUrls(fileIds) {
+  const uniqueFileIds = Array.from(new Set(fileIds.filter(Boolean)));
+
+  if (!uniqueFileIds.length) {
+    return {};
+  }
+
+  const urlMap = {};
+
+  for (let i = 0; i < uniqueFileIds.length; i += TEMP_URL_BATCH_SIZE) {
+    const fileList = uniqueFileIds.slice(i, i + TEMP_URL_BATCH_SIZE);
+    const res = await wx.cloud.getTempFileURL({ fileList });
+
+    (res.fileList || []).forEach((item) => {
+      urlMap[item.fileID] = item.tempFileURL || "";
+    });
+  }
+
+  return urlMap;
+}
+
+async function updateFolderImageCount(folderPath, delta) {
+  if (!folderPath || !delta) {
+    return;
+  }
+
+  const db = getDb();
+  const now = Date.now();
+
+  if (delta > 0) {
+    const _ = db.command;
+    await db.collection(FOLDERS_COLLECTION).where({
+      path: folderPath,
+    }).update({
+      data: {
+        imageCount: _.inc(delta),
+        updatedAt: now,
+      },
+    });
+    return;
+  }
+
+  const folderRes = await db.collection(FOLDERS_COLLECTION).where({
+    path: folderPath,
+  }).limit(1).get();
+  const currentCount = Number(folderRes.data[0]?.imageCount) || 0;
+
+  await db.collection(FOLDERS_COLLECTION).where({
+    path: folderPath,
+  }).update({
+    data: {
+      imageCount: Math.max(0, currentCount + delta),
+      updatedAt: now,
+    },
+  });
+}
+
+async function ensureRootFolder() {
+  const db = getDb();
+  const query = await db.collection(FOLDERS_COLLECTION).where({
+    path: ROOT_PATH,
+  }).limit(1).get();
+
+  if (query.data.length > 0) {
+    return query.data[0];
+  }
+
+  const now = Date.now();
+  const rootFolder = {
+    name: "root",
+    path: ROOT_PATH,
+    parentPath: "",
+    depth: 0,
+    imageCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await db.collection(FOLDERS_COLLECTION).add({
+    data: rootFolder,
+  });
+
+  return rootFolder;
+}
+
+async function createFolder(parentPath, name) {
+  const db = getDb();
+  const folderName = assertValidName(name, "分组名称");
+  const path = joinPath(parentPath, folderName);
+  const existed = await db.collection(FOLDERS_COLLECTION).where({
+    path,
+  }).limit(1).get();
+
+  if (existed.data.length > 0) {
+    throw new Error("该分组已存在");
+  }
+
+  const now = Date.now();
+  await db.collection(FOLDERS_COLLECTION).add({
+    data: {
+      name: folderName,
+      path,
+      parentPath,
+      depth: getDepth(path),
+      imageCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    },
+  });
+}
+
 async function listAllFolders() {
   const db = getDb();
   const folders = await getAllCollectionData(
-    db
-      .collection(FOLDERS_COLLECTION)
+    db.collection(FOLDERS_COLLECTION)
       .orderBy("depth", "asc")
       .orderBy("name", "asc"),
   );
 
   return folders.map((folder) => ({
     ...folder,
+    imageCount: Number(folder.imageCount) || 0,
     breadcrumbName: buildBreadcrumbs(folder.path)
       .map((item) => item.name)
       .join(" / "),
   }));
 }
 
-async function listFolderContent(folderPath) {
+async function listFolderContent(folderPath, options = {}) {
   const db = getDb();
-  const [foldersRes, imagesRes] = await Promise.all([
-    getAllCollectionData(
-      db
-        .collection(FOLDERS_COLLECTION)
-        .where({
-          parentPath: folderPath,
-        })
-        .orderBy("name", "asc"),
-    ),
-    getAllCollectionData(
-      db
-        .collection(IMAGES_COLLECTION)
-        .where({
-          folderPath,
-        })
-        .orderBy("createdAt", "desc"),
-    ),
+  const { page, pageSize, keyword, sortBy } = normalizeListOptions(options);
+  const folderWhere = buildFolderWhere(db, folderPath, keyword);
+  const imageWhere = buildImageWhere(db, folderPath, keyword);
+  const imageSkip = (page - 1) * pageSize;
+
+  const folderQuery = applySort(
+    db.collection(FOLDERS_COLLECTION).where(folderWhere),
+    getFolderSort(sortBy),
+  );
+  const imageBaseQuery = db.collection(IMAGES_COLLECTION).where(imageWhere);
+  const imageListQuery = applySort(imageBaseQuery, getImageSort(sortBy))
+    .skip(imageSkip)
+    .limit(pageSize);
+
+  const [foldersRes, folderCountRes, imagesRes, imageCountRes] = await Promise.all([
+    getAllCollectionData(folderQuery, MAX_PAGE_SIZE),
+    db.collection(FOLDERS_COLLECTION).where(folderWhere).count(),
+    imageListQuery.get(),
+    db.collection(IMAGES_COLLECTION).where(imageWhere).count(),
   ]);
 
-  const folderPaths = foldersRes.map((folder) => folder.path);
-  const imageCounts = {};
-
-  if (folderPaths.length > 0) {
-    const counts = await Promise.all(
-      folderPaths.map(async (path) => {
-        const count = await db
-          .collection(IMAGES_COLLECTION)
-          .where({
-            folderPath: path,
-          })
-          .count();
-        return { path, count: count.total || 0 };
-      }),
-    );
-
-    counts.forEach(({ path, count }) => {
-      imageCounts[path] = count;
-    });
-  }
-
+  const imagesRaw = imagesRes.data || [];
+  const fileIds = imagesRaw.map((item) => item.cloudFileId).filter(Boolean);
+  const urlMap = await getTempUrls(fileIds);
   const folders = foldersRes.map((folder) => ({
     ...folder,
-    imageCount: imageCounts[folder.path] || 0,
+    imageCount: Number(folder.imageCount) || 0,
   }));
-
-  const fileIds = imagesRes.map((item) => item.cloudFileId).filter(Boolean);
-  const urlMap = await getTempUrls(fileIds);
-  const images = imagesRes.map((item) => ({
+  const images = imagesRaw.map((item) => ({
     ...item,
     previewUrl: urlMap[item.cloudFileId] || "",
   }));
+  const imageTotal = imageCountRes.total || 0;
 
   return {
     folders,
     images,
+    pagination: {
+      page,
+      pageSize,
+      folderTotal: folderCountRes.total || folders.length,
+      imageTotal,
+      imageLoaded: imageSkip + images.length,
+      hasMoreImages: imageSkip + images.length < imageTotal,
+    },
   };
 }
 
-async function uploadImageToCloud(
-  filePath,
-  folderPath,
-  originalName,
-  metadata = {},
-) {
-  const sourceName =
-    originalName || getFileName(filePath) || `${Date.now()}.jpg`;
+async function uploadImageToCloud(filePath, folderPath, originalName, metadata = {}) {
+  const sourceName = originalName || getFileName(filePath) || `${Date.now()}.jpg`;
   const fileName = assertValidName(sourceName, "图片名称", 100);
   const ext = getFileExt(fileName || filePath);
   const cloudPath = createCloudPath(folderPath, ext);
-  const size = Number(metadata.size) || (await getLocalFileSize(filePath));
+  const size = Number(metadata.size) || await getLocalFileSize(filePath);
   const uploadRes = await wx.cloud.uploadFile({
     cloudPath,
     filePath,
@@ -341,6 +460,7 @@ async function uploadImageToCloud(
       updatedAt: now,
     },
   });
+  await updateFolderImageCount(folderPath, 1);
 }
 
 async function renameImage(imageId, name) {
@@ -355,16 +475,13 @@ async function renameImage(imageId, name) {
   const nextName = assertValidName(name, "图片名称", 100);
   const nextExt = hasFileExt(nextName) ? getFileExt(nextName) : image.ext;
 
-  await db
-    .collection(IMAGES_COLLECTION)
-    .doc(imageId)
-    .update({
-      data: {
-        name: nextName,
-        ext: nextExt,
-        updatedAt: Date.now(),
-      },
-    });
+  await db.collection(IMAGES_COLLECTION).doc(imageId).update({
+    data: {
+      name: nextName,
+      ext: nextExt,
+      updatedAt: Date.now(),
+    },
+  });
 }
 
 async function moveImages(imageIds, targetFolderPath) {
@@ -375,32 +492,55 @@ async function moveImages(imageIds, targetFolderPath) {
     return 0;
   }
 
-  const folderRes = await db
-    .collection(FOLDERS_COLLECTION)
-    .where({
-      path: targetFolderPath,
-    })
-    .limit(1)
-    .get();
+  const folderRes = await db.collection(FOLDERS_COLLECTION).where({
+    path: targetFolderPath,
+  }).limit(1).get();
 
   if (!folderRes.data.length) {
     throw new Error("目标分组不存在");
   }
 
-  const now = Date.now();
-  await runInBatches(ids, (imageId) =>
-    db
-      .collection(IMAGES_COLLECTION)
-      .doc(imageId)
-      .update({
-        data: {
-          folderPath: targetFolderPath,
-          updatedAt: now,
-        },
-      }),
+  const imageDocs = await Promise.all(
+    ids.map(async (imageId) => {
+      try {
+        const res = await db.collection(IMAGES_COLLECTION).doc(imageId).get();
+        return res.data;
+      } catch (error) {
+        return null;
+      }
+    }),
+  );
+  const movableImages = imageDocs.filter(
+    (item) => item && item.folderPath !== targetFolderPath,
   );
 
-  return ids.length;
+  if (!movableImages.length) {
+    return 0;
+  }
+
+  const now = Date.now();
+  await runInBatches(movableImages, (image) =>
+    db.collection(IMAGES_COLLECTION).doc(image._id).update({
+      data: {
+        folderPath: targetFolderPath,
+        updatedAt: now,
+      },
+    }),
+  );
+
+  const sourceCountMap = movableImages.reduce((acc, image) => {
+    acc[image.folderPath] = (acc[image.folderPath] || 0) + 1;
+    return acc;
+  }, {});
+
+  await Promise.all([
+    ...Object.entries(sourceCountMap).map(([folderPath, count]) =>
+      updateFolderImageCount(folderPath, -count),
+    ),
+    updateFolderImageCount(targetFolderPath, movableImages.length),
+  ]);
+
+  return movableImages.length;
 }
 
 async function renameFolder(folderPath, name) {
@@ -409,13 +549,9 @@ async function renameFolder(folderPath, name) {
   }
 
   const db = getDb();
-  const folderRes = await db
-    .collection(FOLDERS_COLLECTION)
-    .where({
-      path: folderPath,
-    })
-    .limit(1)
-    .get();
+  const folderRes = await db.collection(FOLDERS_COLLECTION).where({
+    path: folderPath,
+  }).limit(1).get();
   const folder = folderRes.data[0];
 
   if (!folder) {
@@ -426,13 +562,9 @@ async function renameFolder(folderPath, name) {
   const nextPath = joinPath(folder.parentPath, folderName);
 
   if (nextPath !== folderPath) {
-    const existed = await db
-      .collection(FOLDERS_COLLECTION)
-      .where({
-        path: nextPath,
-      })
-      .limit(1)
-      .get();
+    const existed = await db.collection(FOLDERS_COLLECTION).where({
+      path: nextPath,
+    }).limit(1).get();
 
     if (existed.data.length > 0) {
       throw new Error("该分组已存在");
@@ -457,35 +589,28 @@ async function renameFolder(folderPath, name) {
 
   await runInBatches(sortedFolders, (item) => {
     const itemPath = replacePathPrefix(item.path, folderPath, nextPath);
-    const parentPath =
-      item.path === folderPath
-        ? folder.parentPath
-        : replacePathPrefix(item.parentPath, folderPath, nextPath);
+    const parentPath = item.path === folderPath
+      ? folder.parentPath
+      : replacePathPrefix(item.parentPath, folderPath, nextPath);
 
-    return db
-      .collection(FOLDERS_COLLECTION)
-      .doc(item._id)
-      .update({
-        data: {
-          name: item.path === folderPath ? folderName : item.name,
-          path: itemPath,
-          parentPath,
-          depth: getDepth(itemPath),
-          updatedAt: now,
-        },
-      });
+    return db.collection(FOLDERS_COLLECTION).doc(item._id).update({
+      data: {
+        name: item.path === folderPath ? folderName : item.name,
+        path: itemPath,
+        parentPath,
+        depth: getDepth(itemPath),
+        updatedAt: now,
+      },
+    });
   });
 
   await runInBatches(images, (item) =>
-    db
-      .collection(IMAGES_COLLECTION)
-      .doc(item._id)
-      .update({
-        data: {
-          folderPath: replacePathPrefix(item.folderPath, folderPath, nextPath),
-          updatedAt: now,
-        },
-      }),
+    db.collection(IMAGES_COLLECTION).doc(item._id).update({
+      data: {
+        folderPath: replacePathPrefix(item.folderPath, folderPath, nextPath),
+        updatedAt: now,
+      },
+    }),
   );
 
   return nextPath;
@@ -493,58 +618,91 @@ async function renameFolder(folderPath, name) {
 
 async function deleteImage(imageId, cloudFileId) {
   const db = getDb();
+  let image = null;
+
+  try {
+    const imageRes = await db.collection(IMAGES_COLLECTION).doc(imageId).get();
+    image = imageRes.data || null;
+  } catch (error) {
+    image = null;
+  }
+
+  const fileID = cloudFileId || image?.cloudFileId;
   const tasks = [db.collection(IMAGES_COLLECTION).doc(imageId).remove()];
 
-  if (cloudFileId) {
-    tasks.unshift(
-      wx.cloud.deleteFile({
-        fileList: [cloudFileId],
-      }),
-    );
+  if (fileID) {
+    tasks.unshift(wx.cloud.deleteFile({
+      fileList: [fileID],
+    }));
   }
 
   await Promise.all(tasks);
+
+  if (image?.folderPath) {
+    await updateFolderImageCount(image.folderPath, -1);
+  }
 }
 
 async function deleteFolder(folderPath) {
   const db = getDb();
   const [subFolders, images] = await Promise.all([
-    db
-      .collection(FOLDERS_COLLECTION)
-      .where({
-        parentPath: folderPath,
-      })
-      .limit(1)
-      .get(),
-    db
-      .collection(IMAGES_COLLECTION)
-      .where({
-        folderPath,
-      })
-      .limit(1)
-      .get(),
+    db.collection(FOLDERS_COLLECTION).where({
+      parentPath: folderPath,
+    }).limit(1).get(),
+    db.collection(IMAGES_COLLECTION).where({
+      folderPath,
+    }).limit(1).get(),
   ]);
 
   if (subFolders.data.length > 0 || images.data.length > 0) {
     throw new Error("该分组不为空，无法删除");
   }
 
-  await db
-    .collection(FOLDERS_COLLECTION)
-    .where({
-      path: folderPath,
-    })
-    .remove();
+  await db.collection(FOLDERS_COLLECTION).where({
+    path: folderPath,
+  }).remove();
+}
+
+async function rebuildFolderImageCounts() {
+  const db = getDb();
+  const [folders, images] = await Promise.all([
+    getAllCollectionData(db.collection(FOLDERS_COLLECTION)),
+    getAllCollectionData(db.collection(IMAGES_COLLECTION)),
+  ]);
+  const countMap = images.reduce((acc, image) => {
+    acc[image.folderPath] = (acc[image.folderPath] || 0) + 1;
+    return acc;
+  }, {});
+  const now = Date.now();
+
+  await runInBatches(folders, (folder) =>
+    db.collection(FOLDERS_COLLECTION).doc(folder._id).update({
+      data: {
+        imageCount: countMap[folder.path] || 0,
+        updatedAt: now,
+      },
+    }),
+  );
+
+  return {
+    folderTotal: folders.length,
+    imageTotal: images.length,
+  };
 }
 
 export {
   ROOT_PATH,
   assertValidName,
   buildBreadcrumbs,
+  createFolder,
+  deleteFolder,
+  deleteImage,
+  ensureRootFolder,
   getParentPath,
   listAllFolders,
   listFolderContent,
   moveImages,
+  rebuildFolderImageCounts,
   renameFolder,
   renameImage,
   uploadImageToCloud,

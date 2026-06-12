@@ -18,7 +18,11 @@
           <text class="btn-icon">↑</text>
           <text class="btn-text">上传</text>
         </view>
-        <view class="btn btn-refresh" @click="loadCurrentContent">
+        <view
+          class="btn btn-refresh"
+          @click="loadCurrentContent"
+          @longpress="handleRebuildCounts"
+        >
           <text class="btn-icon">⟳</text>
         </view>
       </view>
@@ -199,10 +203,10 @@
       </view>
 
       <!-- 加载更多提示 -->
-      <view v-if="gridItems.length > pageSize && hasMore" class="loading-more">
+      <view v-if="hasMore" class="loading-more">
         <text>{{ loadingMore ? "加载中..." : "上拉加载更多" }}</text>
       </view>
-      <view v-else-if="gridItems.length > pageSize" class="no-more">
+      <view v-else-if="imageList.length > 0" class="no-more">
         <text>没有更多了</text>
       </view>
     </scroll-view>
@@ -223,6 +227,7 @@ import {
   listAllFolders,
   listFolderContent,
   moveImages,
+  rebuildFolderImageCounts,
   renameFolder,
   renameImage,
   uploadImageToCloud,
@@ -276,29 +281,13 @@ const showError = (error, fallback) => {
   uni.showToast({ title: error.message || fallback, icon: "none" });
 };
 
-const compareText = (a, b) => {
-  return String(a || "").localeCompare(String(b || ""), "zh-Hans-CN");
-};
-
-const compareTimeDesc = (a, b) => {
-  return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
-};
-
-const sortByGroup = (items, comparator) => {
-  const folders = items
-    .filter((item) => item.type === "folder")
-    .sort(comparator);
-  const images = items
-    .filter((item) => item.type === "image")
-    .sort(comparator);
-  return [...folders, ...images];
-};
-
 // 响应式数据
 const currentPath = ref(ROOT_PATH);
 const breadcrumbs = ref([{ name: "root", path: ROOT_PATH }]);
 const folderList = ref([]);
 const imageList = ref([]);
+const folderTotal = ref(0);
+const imageTotal = ref(0);
 const loading = ref(false);
 const refreshing = ref(false);
 const searchKeyword = ref("");
@@ -320,6 +309,7 @@ const moveTargetPath = ref("");
 const pageSize = ref(20);
 const currentPage = ref(1);
 const loadingMore = ref(false);
+const suppressFilterWatch = ref(false);
 
 const sortOptions = [
   { label: "默认排序", value: "default" },
@@ -329,7 +319,7 @@ const sortOptions = [
 ];
 
 // 计算属性
-const baseGridItems = computed(() => {
+const gridItems = computed(() => {
   return [
     ...folderList.value.map((folder) => ({
       type: "folder",
@@ -345,46 +335,12 @@ const baseGridItems = computed(() => {
   ];
 });
 
-const gridItems = computed(() => {
-  const keyword = searchKeyword.value.trim().toLowerCase();
-  let items = baseGridItems.value;
-
-  if (keyword) {
-    items = items.filter((item) => {
-      const name = String(item.name || "").toLowerCase();
-      const ext = String(item.ext || "").toLowerCase();
-      return name.includes(keyword) || ext.includes(keyword);
-    });
-  }
-
-  const currentSort = sortOptions[sortIndex.value]?.value;
-  if (currentSort === "name") {
-    return sortByGroup([...items], (a, b) => compareText(a.name, b.name));
-  }
-
-  if (currentSort === "time") {
-    return [...items].sort(compareTimeDesc);
-  }
-
-  if (currentSort === "size") {
-    return sortByGroup([...items], (a, b) => {
-      if (a.type === "folder" && b.type === "folder") {
-        return compareText(a.name, b.name);
-      }
-      return (b.size || 0) - (a.size || 0);
-    });
-  }
-
-  return items;
-});
-
 const displayItems = computed(() => {
-  const endIndex = currentPage.value * pageSize.value;
-  return gridItems.value.slice(0, endIndex);
+  return gridItems.value;
 });
 
 const hasMore = computed(() => {
-  return displayItems.value.length < gridItems.value.length;
+  return imageList.value.length < imageTotal.value;
 });
 
 const previewUrls = computed(() => {
@@ -415,13 +371,16 @@ const emptyText = computed(() => {
 });
 
 const contentSummary = computed(() => {
-  const total = `${folderList.value.length} 个分组 · ${imageList.value.length} 张图片`;
+  const loadedText = imageTotal.value > imageList.value.length
+    ? `，已加载 ${imageList.value.length}/${imageTotal.value} 张图片`
+    : "";
+  const total = `${folderTotal.value} 个分组 · ${imageTotal.value} 张图片${loadedText}`;
 
   if (!searchKeyword.value.trim()) {
     return total;
   }
 
-  return `${total} · 当前匹配 ${gridItems.value.length} 项`;
+  return `当前匹配 ${total}`;
 });
 
 // 方法
@@ -437,21 +396,53 @@ const bootstrap = async () => {
   }
 };
 
-const loadCurrentContent = async () => {
+const getListQueryOptions = (page = 1) => ({
+  page,
+  pageSize: pageSize.value,
+  keyword: searchKeyword.value,
+  sortBy: sortOptions[sortIndex.value]?.value || "default",
+});
+
+const loadCurrentContent = async (options = {}) => {
+  const append = Boolean(options.append);
+  const nextPage = append ? currentPage.value + 1 : 1;
+
+  if (append && (loadingMore.value || !hasMore.value)) {
+    return;
+  }
+
   try {
-    // 只有在非刷新状态下才显示 loading
-    if (!refreshing.value) {
+    if (append) {
+      loadingMore.value = true;
+    } else if (!refreshing.value) {
       loading.value = true;
     }
-    const { folders, images } = await listFolderContent(currentPath.value);
-    folderList.value = folders;
-    imageList.value = images;
-    currentPage.value = 1;
+
+    const { folders, images, pagination } = await listFolderContent(
+      currentPath.value,
+      getListQueryOptions(nextPage),
+    );
+
+    if (append) {
+      imageList.value = imageList.value.concat(images);
+    } else {
+      folderList.value = folders;
+      imageList.value = images;
+      currentPage.value = 1;
+    }
+
+    if (append) {
+      currentPage.value = nextPage;
+    }
+
+    folderTotal.value = pagination?.folderTotal || folders.length;
+    imageTotal.value = pagination?.imageTotal || imageList.value.length;
     breadcrumbs.value = buildBreadcrumbs(currentPath.value);
   } catch (error) {
     showError(error, "加载失败");
   } finally {
     loading.value = false;
+    loadingMore.value = false;
     refreshing.value = false;
   }
 };
@@ -466,9 +457,11 @@ const enterFolder = async (path) => {
     return;
   }
   cancelSelection();
+  suppressFilterWatch.value = true;
   searchKeyword.value = "";
   currentPath.value = path;
   await loadCurrentContent();
+  suppressFilterWatch.value = false;
 };
 
 const goBack = async () => {
@@ -476,9 +469,11 @@ const goBack = async () => {
     return;
   }
   cancelSelection();
+  suppressFilterWatch.value = true;
   searchKeyword.value = "";
   currentPath.value = getParentPath(currentPath.value);
   await loadCurrentContent();
+  suppressFilterWatch.value = false;
 };
 
 const handleSortChange = (event) => {
@@ -607,11 +602,7 @@ const loadMoreInternal = () => {
   if (loadingMore.value || !hasMore.value) {
     return;
   }
-  loadingMore.value = true;
-  setTimeout(() => {
-    currentPage.value++;
-    loadingMore.value = false;
-  }, 300);
+  loadCurrentContent({ append: true });
 };
 
 const loadMore = debounce(loadMoreInternal, 200);
@@ -881,8 +872,41 @@ const handleDeleteFolder = async (item) => {
   }
 };
 
-watch([searchKeyword, sortIndex], () => {
+const handleRebuildCounts = async () => {
+  const modal = await uni.showModal({
+    title: "重建图片数",
+    content: "将重新统计所有分组的直属图片数量，用于修复历史数据或异常计数。",
+  });
+
+  if (!modal.confirm) {
+    return;
+  }
+
+  try {
+    await withLoading("统计中", async () => {
+      const result = await rebuildFolderImageCounts();
+      uni.showToast({
+        title: `已统计 ${result.folderTotal} 个分组`,
+        icon: "none",
+      });
+    });
+    await loadCurrentContent();
+  } catch (error) {
+    showError(error, "重建失败");
+  }
+};
+
+const reloadWithFilters = debounce(() => {
+  cancelSelection();
   currentPage.value = 1;
+  loadCurrentContent();
+}, 350);
+
+watch([searchKeyword, sortIndex], () => {
+  if (suppressFilterWatch.value) {
+    return;
+  }
+  reloadWithFilters();
 });
 
 // 生命周期
