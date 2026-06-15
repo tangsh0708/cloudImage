@@ -54,6 +54,7 @@ function useGalleryPage() {
   const pageSize = ref(PAGE_SIZE);
   const currentPage = ref(1);
   const loadingMore = ref(false);
+  const loadRequestId = ref(0);
   const suppressFilterWatch = ref(false);
   const sortOptions = SORT_OPTIONS;
 
@@ -115,9 +116,10 @@ function useGalleryPage() {
     return `当前匹配 ${total}`;
   });
 
-  const getListQueryOptions = (page = 1) => ({
+  const getListQueryOptions = (page = 1, includeFolders = true) => ({
     page,
     pageSize: pageSize.value,
+    includeFolders,
     keyword: searchKeyword.value,
     sortBy: sortOptions[sortIndex.value]?.value || "default",
   });
@@ -130,17 +132,24 @@ function useGalleryPage() {
       return;
     }
 
+    const requestId = ++loadRequestId.value;
+
     try {
       if (append) {
         loadingMore.value = true;
       } else if (!refreshing.value) {
+        loadingMore.value = false;
         loading.value = true;
       }
 
       const { folders, images, pagination } = await listFolderContent(
         currentPath.value,
-        getListQueryOptions(nextPage),
+        getListQueryOptions(nextPage, !append),
       );
+
+      if (requestId !== loadRequestId.value) {
+        return;
+      }
 
       if (append) {
         imageList.value = imageList.value.concat(images);
@@ -151,15 +160,21 @@ function useGalleryPage() {
         currentPage.value = 1;
       }
 
-      folderTotal.value = pagination?.folderTotal || folders.length;
-      imageTotal.value = pagination?.imageTotal || imageList.value.length;
+      if (!append) {
+        folderTotal.value = pagination?.folderTotal ?? folders.length;
+      }
+      imageTotal.value = pagination?.imageTotal ?? imageList.value.length;
       breadcrumbs.value = buildBreadcrumbs(currentPath.value);
     } catch (error) {
-      showError(error, "加载失败");
+      if (requestId === loadRequestId.value) {
+        showError(error, "加载失败");
+      }
     } finally {
-      loading.value = false;
-      loadingMore.value = false;
-      refreshing.value = false;
+      if (requestId === loadRequestId.value) {
+        loading.value = false;
+        loadingMore.value = false;
+        refreshing.value = false;
+      }
     }
   };
 
@@ -252,6 +267,8 @@ function useGalleryPage() {
           path: filePath,
           name: tempFiles[index]?.name || getLocalFileName(filePath),
           size: tempFiles[index]?.size || 0,
+          width: tempFiles[index]?.width || 0,
+          height: tempFiles[index]?.height || 0,
         }))
         .filter((file) => file.path);
 
@@ -268,7 +285,11 @@ function useGalleryPage() {
             file.path,
             currentPath.value,
             file.name,
-            { size: file.size },
+            {
+              height: file.height,
+              size: file.size,
+              width: file.width,
+            },
           ).finally(() => {
             completed++;
             uni.showLoading({
@@ -329,7 +350,7 @@ function useGalleryPage() {
   };
 
   const loadMoreInternal = () => {
-    if (loadingMore.value || !hasMore.value) {
+    if (loading.value || refreshing.value || loadingMore.value || !hasMore.value) {
       return;
     }
     loadCurrentContent({ append: true });

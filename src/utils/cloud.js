@@ -138,6 +138,7 @@ function normalizeListOptions(options = {}) {
   return {
     page,
     pageSize,
+    includeFolders: options.includeFolders !== false,
     keyword: String(options.keyword || options.searchKeyword || "").trim(),
     sortBy: options.sortBy || "default",
   };
@@ -227,6 +228,29 @@ async function getLocalFileSize(filePath) {
       filePath,
       success: (res) => resolve(res.size || 0),
       fail: () => resolve(0),
+    });
+  });
+}
+
+async function getLocalImageInfo(filePath) {
+  if (typeof uni === "undefined" || !uni.getImageInfo) {
+    return {
+      width: 0,
+      height: 0,
+    };
+  }
+
+  return new Promise((resolve) => {
+    uni.getImageInfo({
+      src: filePath,
+      success: (res) => resolve({
+        width: Math.round(Number(res.width) || 0),
+        height: Math.round(Number(res.height) || 0),
+      }),
+      fail: () => resolve({
+        width: 0,
+        height: 0,
+      }),
     });
   });
 }
@@ -387,23 +411,33 @@ async function listAllFolders() {
 
 async function listFolderContent(folderPath, options = {}) {
   const db = getDb();
-  const { page, pageSize, keyword, sortBy } = normalizeListOptions(options);
+  const {
+    page,
+    pageSize,
+    includeFolders,
+    keyword,
+    sortBy,
+  } = normalizeListOptions(options);
   const folderWhere = buildFolderWhere(db, folderPath, keyword);
   const imageWhere = buildImageWhere(db, folderPath, keyword);
   const imageSkip = (page - 1) * pageSize;
 
-  const folderQuery = applySort(
-    db.collection(FOLDERS_COLLECTION).where(folderWhere),
-    getFolderSort(sortBy),
-  );
+  const foldersPromise = includeFolders
+    ? getAllCollectionData(
+      applySort(
+        db.collection(FOLDERS_COLLECTION).where(folderWhere),
+        getFolderSort(sortBy),
+      ),
+      MAX_PAGE_SIZE,
+    )
+    : Promise.resolve([]);
   const imageBaseQuery = db.collection(IMAGES_COLLECTION).where(imageWhere);
   const imageListQuery = applySort(imageBaseQuery, getImageSort(sortBy))
     .skip(imageSkip)
     .limit(pageSize);
 
-  const [foldersRes, folderCountRes, imagesRes, imageCountRes] = await Promise.all([
-    getAllCollectionData(folderQuery, MAX_PAGE_SIZE),
-    db.collection(FOLDERS_COLLECTION).where(folderWhere).count(),
+  const [foldersRes, imagesRes, imageCountRes] = await Promise.all([
+    foldersPromise,
     imageListQuery.get(),
     db.collection(IMAGES_COLLECTION).where(imageWhere).count(),
   ]);
@@ -427,7 +461,8 @@ async function listFolderContent(folderPath, options = {}) {
     pagination: {
       page,
       pageSize,
-      folderTotal: folderCountRes.total || folders.length,
+      includeFolders,
+      folderTotal: includeFolders ? folders.length : undefined,
       imageTotal,
       imageLoaded: imageSkip + images.length,
       hasMoreImages: imageSkip + images.length < imageTotal,
@@ -440,7 +475,15 @@ async function uploadImageToCloud(filePath, folderPath, originalName, metadata =
   const fileName = assertValidName(sourceName, "图片名称", 100);
   const ext = getFileExt(fileName || filePath);
   const cloudPath = createCloudPath(folderPath, ext);
-  const size = Number(metadata.size) || await getLocalFileSize(filePath);
+  const metadataWidth = Math.round(Number(metadata.width) || 0);
+  const metadataHeight = Math.round(Number(metadata.height) || 0);
+  const imageInfoPromise = metadataWidth && metadataHeight
+    ? Promise.resolve({ width: metadataWidth, height: metadataHeight })
+    : getLocalImageInfo(filePath);
+  const [size, imageInfo] = await Promise.all([
+    Number(metadata.size) || getLocalFileSize(filePath),
+    imageInfoPromise,
+  ]);
   const uploadRes = await wx.cloud.uploadFile({
     cloudPath,
     filePath,
@@ -453,6 +496,8 @@ async function uploadImageToCloud(filePath, folderPath, originalName, metadata =
       name: fileName,
       ext,
       size,
+      width: imageInfo.width,
+      height: imageInfo.height,
       folderPath,
       cloudFileId: uploadRes.fileID,
       filePath: cloudPath,

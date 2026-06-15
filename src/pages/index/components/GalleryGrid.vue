@@ -49,7 +49,7 @@
           <text v-if="item.type === 'folder'" class="item-count">
             {{ item.imageCount > 0 ? `${item.imageCount} 张图片` : "空分组" }}
           </text>
-          <text v-else class="item-meta">{{ formatFileSize(item.size) }}</text>
+          <text v-else class="item-meta">{{ formatImageMeta(item) }}</text>
         </view>
 
         <view v-if="item.type === 'folder'" class="folder-badge">📁</view>
@@ -66,7 +66,8 @@
 </template>
 
 <script setup>
-import { formatFileSize } from "../helpers";
+import { computed } from "vue";
+import { formatImageMeta } from "../helpers";
 
 const props = defineProps({
   emptyText: {
@@ -123,8 +124,10 @@ const getItemKey = (item) => {
   return item.type === "folder" ? item.path : item._id;
 };
 
+const selectedIdSet = computed(() => new Set(props.selectedIds));
+
 const isSelected = (item) => {
-  return item.type === "image" && props.selectedIds.includes(item._id);
+  return item.type === "image" && selectedIdSet.value.has(item._id);
 };
 </script>
 

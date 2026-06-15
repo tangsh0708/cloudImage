@@ -44,6 +44,18 @@ const formatFileSize = (bytes) => {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 };
 
+const formatImageMeta = (image) => {
+  const sizeText = formatFileSize(image?.size);
+  const width = Math.round(Number(image?.width) || 0);
+  const height = Math.round(Number(image?.height) || 0);
+
+  if (!width || !height) {
+    return sizeText;
+  }
+
+  return `${sizeText} · ${width}×${height}`;
+};
+
 const getLocalFileName = (filePath) => {
   return String(filePath || "")
     .split(/[\\/]/)
@@ -57,6 +69,7 @@ const showError = (error, fallback) => {
 export {
   debounce,
   formatFileSize,
+  formatImageMeta,
   getLocalFileName,
   showError,
   withLoading,
